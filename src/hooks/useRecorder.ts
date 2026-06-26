@@ -7,7 +7,7 @@ import {
   listDevices,
   stopStream,
 } from "../lib/capture";
-import { Compositor } from "../lib/compositor";
+import { createCompositor, type Compositor } from "../lib/compositor";
 import { AudioMixer } from "../lib/audioMixer";
 import { Recorder, type RecordingResult } from "../lib/recorder";
 import {
@@ -31,6 +31,8 @@ interface RecorderHook {
   webcamStream: MediaStream | null;
   /** The live compositor, so the preview can paint composited frames. */
   compositor: Compositor | null;
+  /** The composited output stream, bound to a <video> for the live preview. */
+  previewStream: MediaStream | null;
   loadDevices: () => Promise<void>;
   beginConfiguring: () => Promise<void>;
   startCountdown: () => void;
@@ -51,6 +53,7 @@ export function useRecorder(): RecorderHook {
   const [result, setResult] = useState<RecordingResult | null>(null);
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
   const [compositor, setCompositor] = useState<Compositor | null>(null);
+  const [previewStream, setPreviewStream] = useState<MediaStream | null>(null);
 
   const supported = useRef(isCaptureSupported()).current;
 
@@ -82,6 +85,7 @@ export function useRecorder(): RecorderHook {
     compositorRef.current?.stop();
     compositorRef.current = null;
     setCompositor(null);
+    setPreviewStream(null);
     stopStream(
       screenStreamRef.current,
       webcamStreamRef.current,
@@ -134,7 +138,7 @@ export function useRecorder(): RecorderHook {
         }
       });
 
-      const comp = new Compositor({
+      const comp = createCompositor({
         screenStream: screen,
         webcamStream: webcam,
         position: config.bubblePosition,
@@ -143,6 +147,10 @@ export function useRecorder(): RecorderHook {
       await comp.start();
       compositorRef.current = comp;
       setCompositor(comp);
+
+      const output = comp.getStream();
+      captureStreamRef.current = output;
+      setPreviewStream(output);
 
       await loadDevices();
       setState("configuring");
@@ -160,10 +168,7 @@ export function useRecorder(): RecorderHook {
 
   // Keep the compositor's bubble in sync with config changes while configuring.
   useEffect(() => {
-    if (compositorRef.current) {
-      compositorRef.current.position = config.bubblePosition;
-      compositorRef.current.size = config.bubbleSize;
-    }
+    compositorRef.current?.setBubble(config.bubblePosition, config.bubbleSize);
   }, [config.bubblePosition, config.bubbleSize]);
 
   const startCountdown = useCallback(() => {
@@ -269,6 +274,7 @@ export function useRecorder(): RecorderHook {
     result,
     webcamStream,
     compositor,
+    previewStream,
     loadDevices,
     beginConfiguring,
     startCountdown,

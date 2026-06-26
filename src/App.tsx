@@ -47,9 +47,17 @@ export default function App() {
               r.state === "countdown" ||
               r.state === "recording" ||
               r.state === "paused") &&
-              r.compositor && (
+              r.previewStream && (
                 <div className="space-y-5">
-                  <CompositePreview compositor={r.compositor} />
+                  <CompositePreview stream={r.previewStream} />
+
+                  {r.state === "configuring" && (
+                    <p className="text-center text-xs text-white/40">
+                      Sharing your whole screen? The preview shows Weaver filming
+                      itself — switch to the app you want to record and it keeps
+                      capturing in the background.
+                    </p>
+                  )}
 
                   {r.state === "configuring" && (
                     <ArrangeControls

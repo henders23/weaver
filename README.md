@@ -57,20 +57,30 @@ Open the printed `http://localhost:5173` URL in **Chrome or Edge**.
 
 ## How it works
 
+Compositing runs in a **Web Worker** so it keeps going when the Weaver tab is
+hidden. (A naïve `requestAnimationFrame` canvas loop on the main thread freezes
+the moment you switch to another app, because browsers pause RAF for
+backgrounded tabs — which would freeze the recording on its last frame.) The
+worker reads `VideoFrame`s via `MediaStreamTrackProcessor`, composites them on an
+`OffscreenCanvas`, and emits frames through a `MediaStreamTrackGenerator`. On
+browsers without these WebCodecs APIs it falls back to the RAF canvas loop.
+
 ```
-Screen stream (getDisplayMedia) ─┐
-                                 ├─► Compositor (canvas RAF loop) ─► canvas.captureStream(30) ─┐
-Webcam stream (getUserMedia) ────┘     • screen drawn full-frame                               ├─► MediaRecorder ─► Blob ─► download
-                                       • webcam drawn as a circular clip                        │
-Mic audio ─┐                                                                                    │
-           ├─► AudioMixer (Web Audio → one track) ──────────────────────────────────────────────┘
+Screen track ─► MediaStreamTrackProcessor ─┐
+                                           ├─► Worker: OffscreenCanvas compositing ─► MediaStreamTrackGenerator ─┐
+Webcam track ─► MediaStreamTrackProcessor ─┘     • screen drawn full-frame                                       ├─► MediaRecorder ─► Blob ─► download
+                                                 • webcam drawn as a circular clip                                │
+Mic audio ─┐                                                                                                      │
+           ├─► AudioMixer (Web Audio → one track) ──────────────────────────────────────────────────────────────┘
 System audio ─┘
 ```
 
 | Module | Responsibility |
 | --- | --- |
 | `src/lib/capture.ts` | `getDisplayMedia` / `getUserMedia` wrappers, device enumeration, error mapping |
-| `src/lib/compositor.ts` | Canvas render loop; draws the screen full-frame + circular webcam bubble |
+| `src/lib/compositor.ts` | `Compositor` interface + factory: off-main-thread `WorkerCompositor` (preferred) and `RafCompositor` fallback |
+| `src/lib/compositorWorker.ts` | Worker render loop: `VideoFrame` in → `OffscreenCanvas` composite → `VideoFrame` out |
+| `src/lib/bubble.ts` | Shared circular-bubble geometry + drawing (used by both engines) |
 | `src/lib/audioMixer.ts` | Merges mic + system audio into one track via the Web Audio API |
 | `src/lib/recorder.ts` | `MediaRecorder` wrapper; codec selection, chunking, pause/resume → `Blob` |
 | `src/lib/download.ts` | Timestamped blob download |

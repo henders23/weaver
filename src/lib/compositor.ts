@@ -1,34 +1,162 @@
-import {
-  BUBBLE_SIZE_FRACTION,
-  type BubblePosition,
-  type BubbleSize,
-} from "../types";
+import { bubbleGeometry, drawBubble } from "./bubble";
+import type { BubblePosition, BubbleSize } from "../types";
 
 export interface CompositorOptions {
   screenStream: MediaStream;
   webcamStream: MediaStream | null;
   position: BubblePosition;
   size: BubbleSize;
-  /** Output frame rate for the composited canvas stream. */
+  /** Output frame rate for the RAF fallback engine. */
   fps?: number;
 }
 
 /**
- * Composites the screen video full-frame with a circular webcam "bubble" drawn
- * on top, using a hidden canvas driven by requestAnimationFrame. The resulting
- * canvas can be exposed as a MediaStream for recording, or used to paint a live
- * preview into a visible canvas.
+ * Produces a single composited video stream (screen + circular webcam bubble).
+ * Two engines implement this:
+ *  - WorkerCompositor: composites off the main thread via WebCodecs insertable
+ *    streams, so it keeps running when the tab is hidden. Preferred.
+ *  - RafCompositor: a requestAnimationFrame canvas fallback for browsers without
+ *    the insertable-streams APIs. NOTE: freezes when the tab is backgrounded.
  */
-export class Compositor {
+export interface Compositor {
+  /** Engine in use, for diagnostics / UI hints. */
+  readonly mode: "worker" | "raf";
+  /** Begin compositing. Resolves once output is flowing. */
+  start(): Promise<void>;
+  /** The composited output as a MediaStream (stable across calls). */
+  getStream(): MediaStream;
+  /** Update the bubble placement live. */
+  setBubble(position: BubblePosition, size: BubbleSize): void;
+  /** Stop compositing. Does NOT stop the source tracks. */
+  stop(): void;
+}
+
+/** True when the off-main-thread pipeline is available (Chromium). */
+export function supportsWorkerPipeline(): boolean {
+  return (
+    typeof MediaStreamTrackProcessor !== "undefined" &&
+    typeof MediaStreamTrackGenerator !== "undefined" &&
+    typeof OffscreenCanvas !== "undefined" &&
+    typeof VideoFrame !== "undefined"
+  );
+}
+
+/** Pick the best available compositing engine. */
+export function createCompositor(opts: CompositorOptions): Compositor {
+  if (supportsWorkerPipeline()) {
+    try {
+      return new WorkerCompositor(opts);
+    } catch {
+      // Fall back if worker construction fails for any reason.
+    }
+  }
+  return new RafCompositor(opts);
+}
+
+// ---------------------------------------------------------------------------
+// Worker engine (preferred)
+// ---------------------------------------------------------------------------
+
+class WorkerCompositor implements Compositor {
+  readonly mode = "worker" as const;
+  private worker: Worker;
+  private opts: CompositorOptions;
+  private generator: MediaStreamTrack | null = null;
+  private outStream: MediaStream | null = null;
+  private started = false;
+
+  constructor(opts: CompositorOptions) {
+    this.opts = opts;
+    this.worker = new Worker(
+      new URL("./compositorWorker.ts", import.meta.url),
+      { type: "module" }
+    );
+  }
+
+  async start(): Promise<void> {
+    const { screenStream, webcamStream, position, size } = this.opts;
+
+    const screenTrack = screenStream.getVideoTracks()[0];
+    if (!screenTrack) throw new Error("No screen video track to composite.");
+    const screenReadable = new MediaStreamTrackProcessor({
+      track: screenTrack,
+    }).readable;
+
+    let webcamReadable: ReadableStream<VideoFrame> | null = null;
+    const webcamTrack = webcamStream?.getVideoTracks()[0];
+    if (webcamTrack) {
+      webcamReadable = new MediaStreamTrackProcessor({
+        track: webcamTrack,
+      }).readable;
+    }
+
+    const generator = new MediaStreamTrackGenerator({ kind: "video" });
+    this.generator = generator;
+    const writable = generator.writable;
+
+    const transfer: Transferable[] = [
+      screenReadable as unknown as Transferable,
+      writable as unknown as Transferable,
+    ];
+    if (webcamReadable) {
+      transfer.push(webcamReadable as unknown as Transferable);
+    }
+
+    this.worker.postMessage(
+      { type: "init", screenReadable, webcamReadable, writable, position, size },
+      transfer
+    );
+    this.started = true;
+  }
+
+  getStream(): MediaStream {
+    if (!this.generator) {
+      throw new Error("Compositor not started.");
+    }
+    if (!this.outStream) {
+      this.outStream = new MediaStream([this.generator]);
+    }
+    return this.outStream;
+  }
+
+  setBubble(position: BubblePosition, size: BubbleSize): void {
+    this.opts.position = position;
+    this.opts.size = size;
+    if (this.started) {
+      this.worker.postMessage({ type: "config", position, size });
+    }
+  }
+
+  stop(): void {
+    try {
+      this.worker.postMessage({ type: "stop" });
+    } catch {
+      /* ignore */
+    }
+    this.worker.terminate();
+    try {
+      this.generator?.stop();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RAF engine (fallback; freezes when the tab is hidden)
+// ---------------------------------------------------------------------------
+
+class RafCompositor implements Compositor {
+  readonly mode = "raf" as const;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private screenVideo: HTMLVideoElement;
   private webcamVideo: HTMLVideoElement | null = null;
   private rafId: number | null = null;
   private fps: number;
-
-  position: BubblePosition;
-  size: BubbleSize;
+  private outStream: MediaStream | null = null;
+  private position: BubblePosition;
+  private size: BubbleSize;
 
   constructor(opts: CompositorOptions) {
     this.position = opts.position;
@@ -46,11 +174,9 @@ export class Compositor {
     }
   }
 
-  /** Wait until the hidden videos report dimensions, then size the canvas. */
   async start(): Promise<void> {
     await waitForVideo(this.screenVideo);
     if (this.webcamVideo) await waitForVideo(this.webcamVideo);
-
     this.resizeCanvasToScreen();
     this.loop();
   }
@@ -69,109 +195,44 @@ export class Compositor {
     this.rafId = requestAnimationFrame(this.loop);
   };
 
-  /** Draw one composited frame. Public so a paused preview can repaint on demand. */
-  drawFrame(): void {
-    // The shared screen can change resolution (e.g. switching windows).
+  private drawFrame(): void {
     this.resizeCanvasToScreen();
     const { ctx, canvas } = this;
-    const cw = canvas.width;
-    const ch = canvas.height;
-
     ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, cw, ch);
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     if (this.screenVideo.readyState >= 2) {
-      ctx.drawImage(this.screenVideo, 0, 0, cw, ch);
+      ctx.drawImage(this.screenVideo, 0, 0, canvas.width, canvas.height);
     }
-
     if (this.webcamVideo && this.webcamVideo.readyState >= 2) {
-      this.drawBubble();
+      const geom = bubbleGeometry(
+        canvas.width,
+        canvas.height,
+        this.position,
+        this.size
+      );
+      drawBubble(
+        ctx,
+        this.webcamVideo,
+        this.webcamVideo.videoWidth,
+        this.webcamVideo.videoHeight,
+        geom
+      );
     }
   }
 
-  private drawBubble(): void {
-    const { ctx, canvas } = this;
-    const webcam = this.webcamVideo!;
-    const radius = (BUBBLE_SIZE_FRACTION[this.size] * canvas.height) / 2;
-    const margin = radius * 0.35;
-    const { cx, cy } = this.bubbleCenter(radius, margin);
-
-    // Cover-fit crop so a non-square webcam fills the circle without distortion.
-    const vw = webcam.videoWidth;
-    const vh = webcam.videoHeight;
-    const side = Math.min(vw, vh);
-    const sx = (vw - side) / 2;
-    const sy = (vh - side) / 2;
-    const diameter = radius * 2;
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.closePath();
-    ctx.clip();
-    ctx.drawImage(
-      webcam,
-      sx,
-      sy,
-      side,
-      side,
-      cx - radius,
-      cy - radius,
-      diameter,
-      diameter
-    );
-    ctx.restore();
-
-    // Subtle ring so the bubble reads against busy backgrounds.
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.lineWidth = Math.max(2, radius * 0.04);
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  private bubbleCenter(
-    radius: number,
-    margin: number
-  ): { cx: number; cy: number } {
-    const { width: w, height: h } = this.canvas;
-    const left = margin + radius;
-    const right = w - margin - radius;
-    const top = margin + radius;
-    const bottom = h - margin - radius;
-    switch (this.position) {
-      case "top-left":
-        return { cx: left, cy: top };
-      case "top-right":
-        return { cx: right, cy: top };
-      case "bottom-left":
-        return { cx: left, cy: bottom };
-      case "bottom-right":
-      default:
-        return { cx: right, cy: bottom };
-    }
-  }
-
-  /** A MediaStream of the composited canvas, suitable for MediaRecorder. */
   getStream(): MediaStream {
-    return this.canvas.captureStream(this.fps);
+    if (!this.outStream) {
+      this.outStream = this.canvas.captureStream(this.fps);
+    }
+    return this.outStream;
   }
 
-  /** Copy the latest composited frame into a visible preview canvas. */
-  paintPreview(target: HTMLCanvasElement): void {
-    if (target.width !== this.canvas.width) target.width = this.canvas.width;
-    if (target.height !== this.canvas.height) target.height = this.canvas.height;
-    const tctx = target.getContext("2d");
-    if (tctx) tctx.drawImage(this.canvas, 0, 0);
+  setBubble(position: BubblePosition, size: BubbleSize): void {
+    this.position = position;
+    this.size = size;
   }
 
-  get outputSize(): { width: number; height: number } {
-    return { width: this.canvas.width, height: this.canvas.height };
-  }
-
-  /** Stop the render loop and detach hidden videos. Does NOT stop the source tracks. */
   stop(): void {
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
@@ -187,7 +248,6 @@ function createHiddenVideo(stream: MediaStream): HTMLVideoElement {
   video.muted = true;
   video.playsInline = true;
   video.srcObject = stream;
-  // Kick off playback; ignore the autoplay promise rejection if any.
   void video.play().catch(() => {});
   return video;
 }

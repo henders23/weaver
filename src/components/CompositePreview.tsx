@@ -1,32 +1,34 @@
 import { useEffect, useRef } from "react";
-import type { Compositor } from "../lib/compositor";
 
 interface Props {
-  compositor: Compositor;
+  stream: MediaStream;
   className?: string;
 }
 
 /**
- * Shows a live, mirror-accurate preview of exactly what will be recorded by
- * copying the compositor's composited frames into a visible canvas each RAF.
+ * Live preview of exactly what will be recorded: the composited output stream
+ * (screen + circular webcam bubble) played in a muted <video>. Using the output
+ * stream directly means the preview reflects the off-main-thread compositor.
  */
-export function CompositePreview({ compositor, className }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+export function CompositePreview({ stream, className }: Props) {
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
-    let raf = 0;
-    const tick = () => {
-      const canvas = canvasRef.current;
-      if (canvas) compositor.paintPreview(canvas);
-      raf = requestAnimationFrame(tick);
+    const video = videoRef.current;
+    if (!video) return;
+    video.srcObject = stream;
+    void video.play().catch(() => {});
+    return () => {
+      video.srcObject = null;
     };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [compositor]);
+  }, [stream]);
 
   return (
-    <canvas
-      ref={canvasRef}
+    <video
+      ref={videoRef}
+      autoPlay
+      muted
+      playsInline
       className={
         "w-full rounded-xl bg-black ring-1 ring-white/10 " + (className ?? "")
       }
