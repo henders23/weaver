@@ -21,6 +21,7 @@ export type RecorderState =
   | "countdown" // 3-2-1 before recording starts
   | "recording"
   | "paused"
+  | "processing" // stopped; compositing the bubble into the final file
   | "preview"; // recording finished, blob ready to review/download
 
 /** User-chosen devices and capture options. */

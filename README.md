@@ -57,34 +57,40 @@ Open the printed `http://localhost:5173` URL in **Chrome or Edge**.
 
 ## How it works
 
-Compositing runs in a **Web Worker** so it keeps going when the Weaver tab is
-hidden. (A naïve `requestAnimationFrame` canvas loop on the main thread freezes
-the moment you switch to another app, because browsers pause RAF for
-backgrounded tabs — which would freeze the recording on its last frame.) The
-worker reads `VideoFrame`s via `MediaStreamTrackProcessor`, composites them on an
-`OffscreenCanvas`, and emits frames through a `MediaStreamTrackGenerator`. On
-browsers without these WebCodecs APIs it falls back to the RAF canvas loop.
+Weaver **records first, composites second**. During recording it captures the
+raw screen and webcam tracks directly with two `MediaRecorder`s — a path that
+runs inside the browser's media pipeline and keeps recording at full frame rate
+even when you switch to another app. When you stop, it plays both recordings
+back **in the foreground** (where there's no background-tab throttling), draws
+each screen frame with the circular webcam bubble on a canvas, mixes the audio,
+and records that into the final single file.
+
+Why not composite live? A `requestAnimationFrame` canvas loop — even in a Web
+Worker fed by `MediaStreamTrackProcessor` — stalls a few seconds after the tab
+is backgrounded, because the frame bridge is still gated by the throttled main
+thread. Recording the raw tracks sidesteps the canvas entirely during capture.
 
 ```
-Screen track ─► MediaStreamTrackProcessor ─┐
-                                           ├─► Worker: OffscreenCanvas compositing ─► MediaStreamTrackGenerator ─┐
-Webcam track ─► MediaStreamTrackProcessor ─┘     • screen drawn full-frame                                       ├─► MediaRecorder ─► Blob ─► download
-                                                 • webcam drawn as a circular clip                                │
-Mic audio ─┐                                                                                                      │
-           ├─► AudioMixer (Web Audio → one track) ──────────────────────────────────────────────────────────────┘
-System audio ─┘
+RECORD (capture)                          COMPOSITE (on stop, foreground)
+Screen track ─► MediaRecorder ─► screen.webm ─┐
+                                              ├─► play both → canvas (screen + circular bubble)
+Webcam track ─► MediaRecorder ─► webcam.webm ─┘        + Web Audio mix (system + mic)
+                                                             └─► MediaRecorder ─► final Blob ─► download
 ```
 
 | Module | Responsibility |
 | --- | --- |
 | `src/lib/capture.ts` | `getDisplayMedia` / `getUserMedia` wrappers, device enumeration, error mapping |
-| `src/lib/compositor.ts` | `Compositor` interface + factory: off-main-thread `WorkerCompositor` (preferred) and `RafCompositor` fallback |
-| `src/lib/compositorWorker.ts` | Worker render loop: `VideoFrame` in → `OffscreenCanvas` composite → `VideoFrame` out |
-| `src/lib/bubble.ts` | Shared circular-bubble geometry + drawing (used by both engines) |
-| `src/lib/audioMixer.ts` | Merges mic + system audio into one track via the Web Audio API |
-| `src/lib/recorder.ts` | `MediaRecorder` wrapper; codec selection, chunking, pause/resume → `Blob` |
+| `src/lib/recorder.ts` | `MediaRecorder` wrapper; codec selection (MP4 where supported, else WebM), pause/resume → `Blob` |
+| `src/lib/compose.ts` | Post-record compositor: plays raw recordings, draws the bubble on a foreground canvas, mixes audio, encodes the final file with progress |
+| `src/lib/compositor.ts` | Live **preview-only** compositor for the arrange screen (RAF canvas) |
+| `src/lib/bubble.ts` | Shared circular-bubble geometry + drawing |
 | `src/lib/download.ts` | Timestamped blob download |
-| `src/hooks/useRecorder.ts` | State machine wiring capture → compositor → mixer → recorder |
+| `src/hooks/useRecorder.ts` | State machine: capture → record raw tracks → compose → preview |
+
+> **Trade-off:** because compositing happens after you stop, there's a short
+> "Processing…" step (roughly the length of the recording) before the file is
+> ready. In exchange, the recording never freezes no matter which app you're in.
 
 ## Roadmap
 

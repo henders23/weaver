@@ -8,8 +8,8 @@ import {
   stopStream,
 } from "../lib/capture";
 import { createCompositor, type Compositor } from "../lib/compositor";
-import { AudioMixer } from "../lib/audioMixer";
 import { Recorder, type RecordingResult } from "../lib/recorder";
+import { composeRecording } from "../lib/compose";
 import {
   DEFAULT_CAPTURE_CONFIG,
   type CaptureConfig,
@@ -26,6 +26,8 @@ interface RecorderHook {
   error: string | null;
   supported: boolean;
   elapsedMs: number;
+  /** 0..1 progress while compositing the final file. */
+  processingProgress: number;
   result: RecordingResult | null;
   /** The live webcam stream, for the setup preview. */
   webcamStream: MediaStream | null;
@@ -50,6 +52,7 @@ export function useRecorder(): RecorderHook {
   const [mics, setMics] = useState<MediaDeviceOption[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [processingProgress, setProcessingProgress] = useState(0);
   const [result, setResult] = useState<RecordingResult | null>(null);
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
   const [compositor, setCompositor] = useState<Compositor | null>(null);
@@ -61,11 +64,20 @@ export function useRecorder(): RecorderHook {
   const screenStreamRef = useRef<MediaStream | null>(null);
   const webcamStreamRef = useRef<MediaStream | null>(null);
   const compositorRef = useRef<Compositor | null>(null);
-  const mixerRef = useRef<AudioMixer | null>(null);
-  const recorderRef = useRef<Recorder | null>(null);
-  const captureStreamRef = useRef<MediaStream | null>(null);
+  const screenRecorderRef = useRef<Recorder | null>(null);
+  const webcamRecorderRef = useRef<Recorder | null>(null);
   const timerRef = useRef<number | null>(null);
   const startTsRef = useRef(0);
+
+  // Mirror latest state/config into refs for callbacks captured in event handlers.
+  const stateRef = useRef(state);
+  const configRef = useRef(config);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
   const loadDevices = useCallback(async () => {
     try {
@@ -77,29 +89,26 @@ export function useRecorder(): RecorderHook {
     }
   }, []);
 
-  const teardownLive = useCallback(() => {
+  const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
+  }, []);
+
+  const teardownLive = useCallback(() => {
+    clearTimer();
     compositorRef.current?.stop();
     compositorRef.current = null;
     setCompositor(null);
     setPreviewStream(null);
-    stopStream(
-      screenStreamRef.current,
-      webcamStreamRef.current,
-      captureStreamRef.current
-    );
+    stopStream(screenStreamRef.current, webcamStreamRef.current);
     screenStreamRef.current = null;
     webcamStreamRef.current = null;
-    captureStreamRef.current = null;
     setWebcamStream(null);
-    void mixerRef.current?.close();
-    mixerRef.current = null;
-  }, []);
+  }, [clearTimer]);
 
-  // Acquire screen + webcam, build the compositor, and move to "configuring".
+  // Acquire screen + webcam, build the preview compositor, move to "configuring".
   const beginConfiguring = useCallback(async () => {
     setError(null);
     try {
@@ -128,11 +137,11 @@ export function useRecorder(): RecorderHook {
       // End the session cleanly if the user clicks the browser's "Stop sharing".
       screen.getVideoTracks()[0]?.addEventListener("ended", () => {
         if (
-          recorderRef.current &&
+          screenRecorderRef.current &&
           (stateRef.current === "recording" || stateRef.current === "paused")
         ) {
           void stop();
-        } else {
+        } else if (stateRef.current !== "processing") {
           teardownLive();
           setState("idle");
         }
@@ -147,10 +156,7 @@ export function useRecorder(): RecorderHook {
       await comp.start();
       compositorRef.current = comp;
       setCompositor(comp);
-
-      const output = comp.getStream();
-      captureStreamRef.current = output;
-      setPreviewStream(output);
+      setPreviewStream(comp.getStream());
 
       await loadDevices();
       setState("configuring");
@@ -166,7 +172,7 @@ export function useRecorder(): RecorderHook {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config, loadDevices, teardownLive]);
 
-  // Keep the compositor's bubble in sync with config changes while configuring.
+  // Keep the preview compositor's bubble in sync with config changes.
   useEffect(() => {
     compositorRef.current?.setBubble(config.bubblePosition, config.bubbleSize);
   }, [config.bubblePosition, config.bubbleSize]);
@@ -176,86 +182,102 @@ export function useRecorder(): RecorderHook {
     setState("countdown");
   }, []);
 
+  const startTimer = useCallback((base: number) => {
+    startTsRef.current = base;
+    timerRef.current = window.setInterval(() => {
+      setElapsedMs(Date.now() - startTsRef.current);
+    }, 200);
+  }, []);
+
+  // Record the raw screen and webcam tracks directly. Recording the tracks
+  // (rather than a live canvas composite) is what survives tab backgrounding —
+  // the bubble is composited afterward in compose.ts. See the "processing" step.
   const startRecording = useCallback(async () => {
-    const comp = compositorRef.current;
-    if (!comp) {
+    const screen = screenStreamRef.current;
+    if (!screen) {
       setError("Capture is not ready.");
       setState("idle");
       return;
     }
-    // Mix mic + system audio into one track.
-    const mixer = new AudioMixer();
-    const audioTrack = mixer.mix(
-      config.micEnabled ? webcamStreamRef.current : null,
-      config.systemAudio ? screenStreamRef.current : null
-    );
-    mixerRef.current = mixer;
 
-    const canvasStream = comp.getStream();
-    captureStreamRef.current = canvasStream;
-    const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
-    if (audioTrack) tracks.push(audioTrack);
-    const combined = new MediaStream(tracks);
+    const screenRec = new Recorder(screen);
+    screenRecorderRef.current = screenRec;
+    screenRec.start();
 
-    const recorder = new Recorder(combined);
-    recorderRef.current = recorder;
-    recorder.start();
+    const webcam = webcamStreamRef.current;
+    if (webcam) {
+      const webcamRec = new Recorder(webcam);
+      webcamRecorderRef.current = webcamRec;
+      webcamRec.start();
+    } else {
+      webcamRecorderRef.current = null;
+    }
 
-    startTsRef.current = Date.now();
     setElapsedMs(0);
-    timerRef.current = window.setInterval(() => {
-      setElapsedMs(Date.now() - startTsRef.current);
-    }, 200);
-
+    startTimer(Date.now());
     setState("recording");
-  }, [config.micEnabled, config.systemAudio]);
+  }, [startTimer]);
 
   const pause = useCallback(() => {
-    recorderRef.current?.pause();
-    if (timerRef.current !== null) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
+    screenRecorderRef.current?.pause();
+    webcamRecorderRef.current?.pause();
+    clearTimer();
     setState("paused");
-  }, []);
+  }, [clearTimer]);
 
   const resume = useCallback(() => {
-    recorderRef.current?.resume();
-    const resumeBase = Date.now() - elapsedMs;
-    timerRef.current = window.setInterval(() => {
-      setElapsedMs(Date.now() - resumeBase);
-    }, 200);
+    screenRecorderRef.current?.resume();
+    webcamRecorderRef.current?.resume();
+    startTimer(Date.now() - elapsedMs);
     setState("recording");
-  }, [elapsedMs]);
+  }, [elapsedMs, startTimer]);
 
   const stop = useCallback(async () => {
-    const recorder = recorderRef.current;
-    if (!recorder) return;
-    if (timerRef.current !== null) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    const res = await recorder.stop();
-    recorderRef.current = null;
-    setResult(res);
+    const screenRec = screenRecorderRef.current;
+    if (!screenRec) return;
+    clearTimer();
+    const durationSec = (Date.now() - startTsRef.current) / 1000;
+
+    // Flush both recordings to blobs before releasing the tracks.
+    const [screenRes, webcamRes] = await Promise.all([
+      screenRec.stop(),
+      webcamRecorderRef.current
+        ? webcamRecorderRef.current.stop()
+        : Promise.resolve(null),
+    ]);
+    screenRecorderRef.current = null;
+    webcamRecorderRef.current = null;
     teardownLive();
-    setState("preview");
-  }, [teardownLive]);
+
+    setProcessingProgress(0);
+    setState("processing");
+    try {
+      const composed = await composeRecording({
+        screenBlob: screenRes.blob,
+        webcamBlob: webcamRes?.blob ?? null,
+        position: configRef.current.bubblePosition,
+        size: configRef.current.bubbleSize,
+        expectedDurationSec: durationSec,
+        onProgress: setProcessingProgress,
+      });
+      setResult(composed);
+      setState("preview");
+    } catch {
+      setError("Could not process the recording. Please try again.");
+      setState("idle");
+    }
+  }, [clearTimer, teardownLive]);
 
   const reset = useCallback(() => {
     teardownLive();
-    recorderRef.current = null;
+    screenRecorderRef.current = null;
+    webcamRecorderRef.current = null;
     setResult(null);
     setElapsedMs(0);
+    setProcessingProgress(0);
     setError(null);
     setState("idle");
   }, [teardownLive]);
-
-  // Mirror state into a ref so the screen-track "ended" handler sees fresh value.
-  const stateRef = useRef(state);
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
 
   // Clean up everything on unmount.
   useEffect(() => {
@@ -271,6 +293,7 @@ export function useRecorder(): RecorderHook {
     error,
     supported,
     elapsedMs,
+    processingProgress,
     result,
     webcamStream,
     compositor,

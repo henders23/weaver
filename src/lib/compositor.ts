@@ -6,148 +6,31 @@ export interface CompositorOptions {
   webcamStream: MediaStream | null;
   position: BubblePosition;
   size: BubbleSize;
-  /** Output frame rate for the RAF fallback engine. */
+  /** Output frame rate for the preview canvas stream. */
   fps?: number;
 }
 
 /**
- * Produces a single composited video stream (screen + circular webcam bubble).
- * Two engines implement this:
- *  - WorkerCompositor: composites off the main thread via WebCodecs insertable
- *    streams, so it keeps running when the tab is hidden. Preferred.
- *  - RafCompositor: a requestAnimationFrame canvas fallback for browsers without
- *    the insertable-streams APIs. NOTE: freezes when the tab is backgrounded.
+ * Live preview compositor: draws the screen full-frame with a circular webcam
+ * bubble on top, on a canvas driven by requestAnimationFrame.
+ *
+ * This is used ONLY for the on-screen arrange/preview — never for the actual
+ * recording. Recording captures the raw screen and webcam tracks directly (see
+ * useRecorder + compose.ts), so the well-known background-tab RAF throttling
+ * that would freeze this preview does not affect the recorded output.
  */
 export interface Compositor {
-  /** Engine in use, for diagnostics / UI hints. */
-  readonly mode: "worker" | "raf";
-  /** Begin compositing. Resolves once output is flowing. */
   start(): Promise<void>;
-  /** The composited output as a MediaStream (stable across calls). */
   getStream(): MediaStream;
-  /** Update the bubble placement live. */
   setBubble(position: BubblePosition, size: BubbleSize): void;
-  /** Stop compositing. Does NOT stop the source tracks. */
   stop(): void;
 }
 
-/** True when the off-main-thread pipeline is available (Chromium). */
-export function supportsWorkerPipeline(): boolean {
-  return (
-    typeof MediaStreamTrackProcessor !== "undefined" &&
-    typeof MediaStreamTrackGenerator !== "undefined" &&
-    typeof OffscreenCanvas !== "undefined" &&
-    typeof VideoFrame !== "undefined"
-  );
-}
-
-/** Pick the best available compositing engine. */
 export function createCompositor(opts: CompositorOptions): Compositor {
-  if (supportsWorkerPipeline()) {
-    try {
-      return new WorkerCompositor(opts);
-    } catch {
-      // Fall back if worker construction fails for any reason.
-    }
-  }
-  return new RafCompositor(opts);
+  return new PreviewCompositor(opts);
 }
 
-// ---------------------------------------------------------------------------
-// Worker engine (preferred)
-// ---------------------------------------------------------------------------
-
-class WorkerCompositor implements Compositor {
-  readonly mode = "worker" as const;
-  private worker: Worker;
-  private opts: CompositorOptions;
-  private generator: MediaStreamTrack | null = null;
-  private outStream: MediaStream | null = null;
-  private started = false;
-
-  constructor(opts: CompositorOptions) {
-    this.opts = opts;
-    this.worker = new Worker(
-      new URL("./compositorWorker.ts", import.meta.url),
-      { type: "module" }
-    );
-  }
-
-  async start(): Promise<void> {
-    const { screenStream, webcamStream, position, size } = this.opts;
-
-    const screenTrack = screenStream.getVideoTracks()[0];
-    if (!screenTrack) throw new Error("No screen video track to composite.");
-    const screenReadable = new MediaStreamTrackProcessor({
-      track: screenTrack,
-    }).readable;
-
-    let webcamReadable: ReadableStream<VideoFrame> | null = null;
-    const webcamTrack = webcamStream?.getVideoTracks()[0];
-    if (webcamTrack) {
-      webcamReadable = new MediaStreamTrackProcessor({
-        track: webcamTrack,
-      }).readable;
-    }
-
-    const generator = new MediaStreamTrackGenerator({ kind: "video" });
-    this.generator = generator;
-    const writable = generator.writable;
-
-    const transfer: Transferable[] = [
-      screenReadable as unknown as Transferable,
-      writable as unknown as Transferable,
-    ];
-    if (webcamReadable) {
-      transfer.push(webcamReadable as unknown as Transferable);
-    }
-
-    this.worker.postMessage(
-      { type: "init", screenReadable, webcamReadable, writable, position, size },
-      transfer
-    );
-    this.started = true;
-  }
-
-  getStream(): MediaStream {
-    if (!this.generator) {
-      throw new Error("Compositor not started.");
-    }
-    if (!this.outStream) {
-      this.outStream = new MediaStream([this.generator]);
-    }
-    return this.outStream;
-  }
-
-  setBubble(position: BubblePosition, size: BubbleSize): void {
-    this.opts.position = position;
-    this.opts.size = size;
-    if (this.started) {
-      this.worker.postMessage({ type: "config", position, size });
-    }
-  }
-
-  stop(): void {
-    try {
-      this.worker.postMessage({ type: "stop" });
-    } catch {
-      /* ignore */
-    }
-    this.worker.terminate();
-    try {
-      this.generator?.stop();
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// RAF engine (fallback; freezes when the tab is hidden)
-// ---------------------------------------------------------------------------
-
-class RafCompositor implements Compositor {
-  readonly mode = "raf" as const;
+class PreviewCompositor implements Compositor {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private screenVideo: HTMLVideoElement;
@@ -238,6 +121,8 @@ class RafCompositor implements Compositor {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
+    this.outStream?.getTracks().forEach((t) => t.stop());
+    this.outStream = null;
     detachVideo(this.screenVideo);
     if (this.webcamVideo) detachVideo(this.webcamVideo);
   }

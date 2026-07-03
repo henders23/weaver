@@ -4,6 +4,7 @@ import { SetupPanel } from "./components/SetupPanel";
 import { CompositePreview } from "./components/CompositePreview";
 import { Countdown } from "./components/Countdown";
 import { RecordingBar } from "./components/RecordingBar";
+import { ProcessingPanel } from "./components/ProcessingPanel";
 import { PreviewPanel } from "./components/PreviewPanel";
 import type { BubblePosition, BubbleSize } from "./types";
 
@@ -54,8 +55,9 @@ export default function App() {
                   {r.state === "configuring" && (
                     <p className="text-center text-xs text-white/40">
                       Sharing your whole screen? The preview shows Weaver filming
-                      itself — switch to the app you want to record and it keeps
-                      capturing in the background.
+                      itself — that's just the preview. Once you start, switch to
+                      the app you want to record; the webcam bubble is added when
+                      you stop.
                     </p>
                   )}
 
@@ -88,6 +90,10 @@ export default function App() {
 
             {r.state === "countdown" && (
               <Countdown onComplete={() => void r.startRecording()} />
+            )}
+
+            {r.state === "processing" && (
+              <ProcessingPanel progress={r.processingProgress} />
             )}
 
             {r.state === "preview" && r.result && (
